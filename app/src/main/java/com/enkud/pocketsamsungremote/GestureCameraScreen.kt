@@ -1,6 +1,7 @@
 package com.enkud.pocketsamsungremote
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -69,6 +70,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -193,6 +197,7 @@ fun GestureCameraScreen(
     }
     var cameraMenuExpanded by remember { mutableStateOf(false) }
     var showInstructions by remember { mutableStateOf(false) }
+    var blackoutActive by rememberSaveable { mutableStateOf(false) }
     var cameraError by remember { mutableStateOf<String?>(null) }
     var overlay by remember { mutableStateOf(GestureOverlayState()) }
     var detectedText by remember { mutableStateOf("Starting hand tracker…") }
@@ -399,6 +404,26 @@ fun GestureCameraScreen(
         gestureAnalyzer?.pointerMode = pointerEnabled
     }
 
+    DisposableEffect(blackoutActive, context) {
+        val activity = context as? Activity
+        val window = activity?.window
+        val insetsController = window?.let {
+            WindowCompat.getInsetsController(it, it.decorView)
+        }
+        if (blackoutActive) {
+            insetsController?.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            insetsController?.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+        }
+        onDispose {
+            if (blackoutActive) {
+                insetsController?.show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
     LaunchedEffect(cursorTrailPoints.isNotEmpty()) {
         while (cursorTrailPoints.isNotEmpty()) {
             delay(50L)
@@ -544,6 +569,13 @@ fun GestureCameraScreen(
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(Modifier.weight(1f))
+                MoonOverlayButton(
+                    onClick = {
+                        cameraMenuExpanded = false
+                        showInstructions = false
+                        blackoutActive = true
+                    }
+                )
                 InfoOverlayButton(onClick = { showInstructions = true })
                 Box {
                     Surface(
@@ -702,6 +734,13 @@ fun GestureCameraScreen(
         if (showInstructions) {
             GestureInstructionOverlay(onDismiss = { showInstructions = false })
         }
+
+        if (blackoutActive) {
+            BlackoutCurtain(
+                isLocked = isLocked,
+                onWake = { blackoutActive = false }
+            )
+        }
     }
 }
 
@@ -745,6 +784,62 @@ private fun InfoOverlayButton(onClick: () -> Unit) {
             fontSize = 18.sp,
             fontWeight = FontWeight.Bold
         )
+    }
+}
+
+@Composable
+private fun MoonOverlayButton(onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .background(Color.Black.copy(alpha = 0.48f), CircleShape)
+            .border(1.dp, Color.White.copy(alpha = 0.3f), CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "\u263E",
+            color = Color.White,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+private fun BlackoutCurtain(
+    isLocked: Boolean,
+    onWake: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .clickable(onClick = onWake)
+    ) {
+        Surface(
+            color = if (isLocked) {
+                Color(0xFFD32F2F).copy(alpha = 0.20f)
+            } else {
+                Color(0xFF15803D).copy(alpha = 0.18f)
+            },
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 18.dp)
+        ) {
+            Text(
+                text = if (isLocked) {
+                    "LOCKED \u2022 TRACKING ONLY"
+                } else {
+                    "UNLOCKED \u2022 TV CONTROL ACTIVE"
+                },
+                color = Color.White.copy(alpha = 0.42f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+            )
+        }
     }
 }
 
