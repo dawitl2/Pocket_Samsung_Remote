@@ -1009,11 +1009,7 @@ fun PocketRemoteApp(viewModel: RemoteViewModel = androidx.lifecycle.viewmodel.co
                 pointerEnabled = pointerEnabled,
                 onCommand = { viewModel.sendKey(it) },
                 onPointerMove = { x, y -> viewModel.movePointer(x, y) },
-                onText = { viewModel.sendHandwritingText(it) },
-                onOpenYouTube = {
-                    tvAppShortcuts.firstOrNull { it.label == "YouTube" }
-                        ?.let(viewModel::openTvApp)
-                }
+                onText = { viewModel.sendHandwritingText(it) }
             )
             else -> HiddenScreenHost(
                 screen = screen,

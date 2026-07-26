@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -58,14 +59,19 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -84,8 +90,10 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 private const val GESTURE_MODEL = "gesture_recognizer.task"
@@ -94,6 +102,7 @@ private const val HANDWRITING_PREVIEW_MS = 220L
 private const val POINTER_TRAIL_BREAK_MS = 280L
 private const val MAX_PERSISTENT_INK_POINTS = 4000
 private const val MIN_USABLE_HAND_SCALE = 0.05f
+private const val ADVANCED_KEY_DWELL_MS = 1350L
 
 private data class CameraOption(
     val id: String,
@@ -101,7 +110,11 @@ private data class CameraOption(
     val label: String
 )
 
-private data class LandmarkPoint(val x: Float, val y: Float)
+private data class LandmarkPoint(
+    val x: Float,
+    val y: Float,
+    val z: Float = 0f
+)
 
 private data class GestureOverlayState(
     val hands: List<List<LandmarkPoint>> = emptyList(),
@@ -112,8 +125,7 @@ private data class GestureOverlayState(
 private data class GestureAction(
     val label: String,
     val commands: List<RemoteCommand>,
-    val delayBetweenCommandsMs: Long = 140L,
-    val launchYouTube: Boolean = false
+    val delayBetweenCommandsMs: Long = 140L
 )
 
 private data class PointerDelta(val x: Int, val y: Int)
@@ -132,6 +144,7 @@ private data class GestureInterpretation(
     val cursorChanged: Boolean = false,
     val pointerDelta: PointerDelta? = null,
     val pointerPoint: AirInkPoint? = null,
+    val keyboardPoint: AirInkPoint? = null,
     val writingPoint: AirInkPoint? = null,
     val finishWritingStroke: Boolean = false,
     val commitWriting: Boolean = false,
@@ -148,6 +161,7 @@ private data class GestureObservation(
     val cursorChanged: Boolean,
     val pointerDelta: PointerDelta?,
     val pointerPoint: AirInkPoint?,
+    val keyboardPoint: AirInkPoint?,
     val writingPoint: AirInkPoint?,
     val finishWritingStroke: Boolean,
     val commitWriting: Boolean,
@@ -162,8 +176,7 @@ fun GestureCameraScreen(
     pointerEnabled: Boolean,
     onCommand: (RemoteCommand) -> Unit,
     onPointerMove: (Int, Int) -> Unit,
-    onText: (String) -> Unit,
-    onOpenYouTube: () -> Unit
+    onText: (String) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -198,6 +211,8 @@ fun GestureCameraScreen(
     var cameraMenuExpanded by remember { mutableStateOf(false) }
     var showInstructions by remember { mutableStateOf(false) }
     var blackoutActive by rememberSaveable { mutableStateOf(false) }
+    var advancedMode by rememberSaveable { mutableStateOf(false) }
+    var manualAdvancedKeyboard by rememberSaveable { mutableStateOf(false) }
     var cameraError by remember { mutableStateOf<String?>(null) }
     var overlay by remember { mutableStateOf(GestureOverlayState()) }
     var detectedText by remember { mutableStateOf("Starting hand tracker…") }
@@ -205,6 +220,8 @@ fun GestureCameraScreen(
     var inferenceMs by remember { mutableStateOf(0L) }
     var isLocked by remember { mutableStateOf(false) }
     var cursorActive by remember { mutableStateOf(false) }
+    var keyboardFingerPoint by remember { mutableStateOf<AirInkPoint?>(null) }
+    var advancedTypedText by rememberSaveable { mutableStateOf("") }
     var handwritingStatus by remember { mutableStateOf("Preparing handwriting model…") }
     var handwrittenText by remember { mutableStateOf("") }
     var letterGuesses by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -277,6 +294,7 @@ fun GestureCameraScreen(
                             }
                             trailClock = point.timeMs
                         }
+                        keyboardFingerPoint = observation.keyboardPoint
                         observation.writingPoint?.let { point ->
                             airWriter.addPoint(point)
                             trailPoints = (
@@ -361,7 +379,6 @@ fun GestureCameraScreen(
                         }
                         observation.action?.let { action ->
                             lastActionText = action.label
-                            if (action.launchYouTube) onOpenYouTube()
                             gestureScope.launch {
                                 action.commands.forEachIndexed { index, command ->
                                     if (index > 0) delay(action.delayBetweenCommandsMs)
@@ -399,9 +416,18 @@ fun GestureCameraScreen(
         }
     }
 
-    LaunchedEffect(imeActive, pointerEnabled, gestureAnalyzer) {
-        gestureAnalyzer?.writingMode = imeActive
+    LaunchedEffect(
+        imeActive,
+        pointerEnabled,
+        advancedMode,
+        manualAdvancedKeyboard,
+        gestureAnalyzer
+    ) {
+        gestureAnalyzer?.writingMode =
+            imeActive || (advancedMode && manualAdvancedKeyboard)
         gestureAnalyzer?.pointerMode = pointerEnabled
+        gestureAnalyzer?.advancedMode = advancedMode
+        gestureAnalyzer?.resetTracking()
     }
 
     DisposableEffect(blackoutActive, context) {
@@ -514,6 +540,18 @@ fun GestureCameraScreen(
         }
     }
 
+    val advancedKeyboardVisible = advancedMode &&
+        (imeActive || manualAdvancedKeyboard) &&
+        !isLocked
+
+    LaunchedEffect(advancedKeyboardVisible) {
+        if (advancedKeyboardVisible) {
+            advancedTypedText = ""
+        } else {
+            keyboardFingerPoint = null
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -526,6 +564,7 @@ fun GestureCameraScreen(
             )
             HandLandmarkOverlay(
                 state = overlay,
+                accentColor = if (advancedMode) Color(0xFFA78BFA) else Color(0xFF55D6FF),
                 modifier = Modifier.fillMaxSize()
             )
             AirWritingTrail(
@@ -556,16 +595,22 @@ fun GestureCameraScreen(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .fillMaxWidth()
-                    .background(Color.Black.copy(alpha = 0.45f))
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                    .background(
+                        if (advancedMode) {
+                            Color(0xFF2E1065).copy(alpha = 0.82f)
+                        } else {
+                            Color.Black.copy(alpha = 0.45f)
+                        }
+                    )
+                    .padding(horizontal = 10.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 RoundOverlayButton(text = "‹", description = "Back", onClick = onBack)
                 Text(
-                    text = "Gesture remote",
-                    color = Color.White,
-                    fontSize = 18.sp,
+                    text = if (advancedMode) "ADVANCED" else "STANDARD",
+                    color = if (advancedMode) Color(0xFFE9D5FF) else Color.White,
+                    fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(Modifier.weight(1f))
@@ -576,13 +621,20 @@ fun GestureCameraScreen(
                         blackoutActive = true
                     }
                 )
+                AdvancedModeButton(
+                    active = advancedMode,
+                    onClick = {
+                        advancedMode = !advancedMode
+                        if (!advancedMode) manualAdvancedKeyboard = false
+                    }
+                )
                 InfoOverlayButton(onClick = { showInstructions = true })
                 Box {
                     Surface(
                         color = Color.Black.copy(alpha = 0.48f),
                         shape = RoundedCornerShape(18.dp),
                         modifier = Modifier
-                            .widthIn(max = 150.dp)
+                            .widthIn(max = 110.dp)
                             .clickable { cameraMenuExpanded = true }
                     ) {
                         Text(
@@ -664,7 +716,7 @@ fun GestureCameraScreen(
                 }
             }
 
-            if (cursorActive && !isLocked) {
+            if (cursorActive && !isLocked && !advancedKeyboardVisible) {
                 Surface(
                     color = Color.Black.copy(alpha = 0.66f),
                     shape = RoundedCornerShape(14.dp),
@@ -698,41 +750,104 @@ fun GestureCameraScreen(
                 }
             }
 
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .background(Color.Black.copy(alpha = 0.62f))
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                cameraError?.let { error ->
+            if (!advancedKeyboardVisible) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .background(Color.Black.copy(alpha = 0.62f))
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    cameraError?.let { error ->
+                        Text(
+                            text = error,
+                            color = Color(0xFFFF8A80),
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(Modifier.height(4.dp))
+                    }
                     Text(
-                        text = error,
-                        color = Color(0xFFFF8A80),
-                        fontSize = 13.sp,
+                        text = detectedText,
+                        color = Color.White,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.Center
                     )
-                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Last command: $lastActionText",
+                        color = if (advancedMode) Color(0xFFC4B5FD) else Color(0xFF55D6FF),
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center
+                    )
                 }
-                Text(
-                    text = detectedText,
-                    color = Color.White,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    textAlign = TextAlign.Center
+            }
+
+            if (advancedKeyboardVisible) {
+                AdvancedHoverKeyboard(
+                    fingerPoint = keyboardFingerPoint,
+                    cameraState = overlay,
+                    typedText = advancedTypedText,
+                    onKey = { key ->
+                        when (key) {
+                            "BACKSPACE" -> {
+                                if (advancedTypedText.isNotEmpty()) {
+                                    advancedTypedText = advancedTypedText.dropLast(1)
+                                    onCommand(RemoteCommand.KEY_BACK)
+                                }
+                            }
+                            "SPACE" -> {
+                                advancedTypedText += " "
+                                onText(advancedTypedText)
+                            }
+                            "ENTER" -> onCommand(RemoteCommand.KEY_ENTER)
+                            else -> {
+                                advancedTypedText += key.lowercase()
+                                onText(advancedTypedText)
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
                 )
-                Text(
-                    text = "Last command: $lastActionText",
-                    color = Color(0xFF55D6FF),
-                    fontSize = 14.sp,
-                    textAlign = TextAlign.Center
+            }
+
+            if (advancedMode) {
+                Surface(
+                    color = if (advancedKeyboardVisible) {
+                        Color(0xFF7C3AED).copy(alpha = 0.92f)
+                    } else {
+                        Color(0xFF2E1065).copy(alpha = 0.82f)
+                    },
+                    shape = CircleShape,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(start = 12.dp, top = 76.dp)
+                        .clickable {
+                            manualAdvancedKeyboard = !advancedKeyboardVisible
+                        }
+                ) {
+                    Text(
+                        text = if (advancedKeyboardVisible) "\u2328 ON" else "\u2328",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp)
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(2.dp, Color(0xFFA78BFA).copy(alpha = 0.52f))
                 )
             }
         }
 
         if (showInstructions) {
-            GestureInstructionOverlay(onDismiss = { showInstructions = false })
+            GestureInstructionOverlay(
+                advancedMode = advancedMode,
+                onDismiss = { showInstructions = false }
+            )
         }
 
         if (blackoutActive) {
@@ -807,6 +922,246 @@ private fun MoonOverlayButton(onClick: () -> Unit) {
 }
 
 @Composable
+private fun AdvancedModeButton(
+    active: Boolean,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .background(
+                if (active) Color(0xFF7C3AED) else Color.Black.copy(alpha = 0.48f),
+                CircleShape
+            )
+            .border(
+                1.dp,
+                if (active) Color(0xFFE9D5FF) else Color.White.copy(alpha = 0.3f),
+                CircleShape
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "A",
+            color = Color.White,
+            fontSize = 17.sp,
+            fontWeight = FontWeight.Black
+        )
+    }
+}
+
+private data class AdvancedKeyboardKey(
+    val id: String,
+    val label: String,
+    val weight: Float = 1f
+)
+
+@Composable
+private fun AdvancedHoverKeyboard(
+    fingerPoint: AirInkPoint?,
+    cameraState: GestureOverlayState,
+    typedText: String,
+    onKey: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val rows = remember {
+        listOf(
+            "QWERTYUIOP".map { AdvancedKeyboardKey(it.toString(), it.toString()) },
+            "ASDFGHJKL".map { AdvancedKeyboardKey(it.toString(), it.toString()) },
+            "ZXCVBNM".map { AdvancedKeyboardKey(it.toString(), it.toString()) } +
+                AdvancedKeyboardKey("BACKSPACE", "\u232B", 1.35f),
+            listOf(
+                AdvancedKeyboardKey("SPACE", "SPACE", 4.5f),
+                AdvancedKeyboardKey("ENTER", "ENTER", 1.7f)
+            )
+        )
+    }
+    var rootSize by remember { mutableStateOf(IntSize.Zero) }
+    var keyBounds by remember { mutableStateOf<Map<String, Rect>>(emptyMap()) }
+    var hoveredKey by remember { mutableStateOf<String?>(null) }
+    var hoverStartedAt by remember { mutableStateOf(0L) }
+    var hoverProgress by remember { mutableStateOf(0f) }
+    var latchedKey by remember { mutableStateOf<String?>(null) }
+    var mappedFingerPoint by remember { mutableStateOf<Offset?>(null) }
+
+    LaunchedEffect(fingerPoint, cameraState, rootSize, keyBounds) {
+        val point = fingerPoint
+        if (point == null ||
+            rootSize == IntSize.Zero ||
+            cameraState.sourceWidth <= 1 ||
+            cameraState.sourceHeight <= 1
+        ) {
+            hoveredKey = null
+            hoverStartedAt = 0L
+            hoverProgress = 0f
+            latchedKey = null
+            mappedFingerPoint = null
+            return@LaunchedEffect
+        }
+
+        val scale = max(
+            rootSize.width.toFloat() / cameraState.sourceWidth,
+            rootSize.height.toFloat() / cameraState.sourceHeight
+        )
+        val mapped = Offset(
+            x = (rootSize.width - cameraState.sourceWidth * scale) / 2f +
+                point.x * cameraState.sourceWidth * scale,
+            y = (rootSize.height - cameraState.sourceHeight * scale) / 2f +
+                point.y * cameraState.sourceHeight * scale
+        )
+        mappedFingerPoint = mapped
+        val hit = keyBounds.entries.firstOrNull { (_, bounds) ->
+            bounds.contains(mapped)
+        }?.key
+
+        if (hit == null) {
+            hoveredKey = null
+            hoverStartedAt = 0L
+            hoverProgress = 0f
+            latchedKey = null
+        } else if (hit != hoveredKey) {
+            hoveredKey = hit
+            hoverStartedAt = point.timeMs
+            hoverProgress = 0f
+            if (latchedKey != hit) latchedKey = null
+        } else if (latchedKey != hit) {
+            hoverProgress = (
+                (point.timeMs - hoverStartedAt).toFloat() / ADVANCED_KEY_DWELL_MS
+            ).coerceIn(0f, 1f)
+            if (hoverProgress >= 1f) {
+                latchedKey = hit
+                onKey(hit)
+            }
+        }
+    }
+
+    Box(
+        modifier = modifier.onSizeChanged { rootSize = it }
+    ) {
+        Surface(
+            color = Color(0xFF120B24).copy(alpha = 0.43f),
+            shape = RoundedCornerShape(24.dp),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 132.dp, start = 5.dp, end = 5.dp)
+                .fillMaxWidth()
+                .border(
+                    1.dp,
+                    Color(0xFFA78BFA).copy(alpha = 0.58f),
+                    RoundedCornerShape(24.dp)
+                )
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 6.dp, vertical = 11.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = typedText.ifBlank { "Point at a key and hold through 1 \u2022 2 \u2022 3" },
+                    color = if (typedText.isBlank()) Color(0xFFC4B5FD) else Color.White,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+                rows.forEachIndexed { index, row ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = if (index == 1) 12.dp else 0.dp),
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        row.forEach { key ->
+                            AdvancedKeyboardKeyView(
+                                key = key,
+                                hovered = hoveredKey == key.id,
+                                progress = if (hoveredKey == key.id) hoverProgress else 0f,
+                                onBounds = { bounds ->
+                                    if (keyBounds[key.id] != bounds) {
+                                        keyBounds = keyBounds + (key.id to bounds)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    if (index != rows.lastIndex) Spacer(Modifier.height(5.dp))
+                }
+            }
+        }
+        mappedFingerPoint?.let { mapped ->
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawCircle(
+                    color = Color.Black.copy(alpha = 0.34f),
+                    radius = 24.dp.toPx(),
+                    center = mapped
+                )
+                drawCircle(
+                    color = Color(0xFFE9D5FF),
+                    radius = 17.dp.toPx(),
+                    center = mapped,
+                    style = Stroke(width = 3.dp.toPx())
+                )
+                drawCircle(
+                    color = Color.White,
+                    radius = 4.dp.toPx(),
+                    center = mapped
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RowScope.AdvancedKeyboardKeyView(
+    key: AdvancedKeyboardKey,
+    hovered: Boolean,
+    progress: Float,
+    onBounds: (Rect) -> Unit
+) {
+    val stage = min(3, (progress * 3f).toInt() + 1)
+    Surface(
+        color = if (hovered) {
+            Color(0xFF6D28D9).copy(alpha = 0.76f)
+        } else {
+            Color(0xFF2E2344).copy(alpha = 0.48f)
+        },
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier
+            .weight(key.weight)
+            .height(64.dp)
+            .onGloballyPositioned { onBounds(it.boundsInRoot()) }
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            if (hovered) {
+                Canvas(modifier = Modifier.size(48.dp)) {
+                    drawArc(
+                        color = Color(0xFFE9D5FF),
+                        startAngle = -90f,
+                        sweepAngle = 360f * progress,
+                        useCenter = false,
+                        style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
+                    )
+                }
+                Text(
+                    text = stage.toString(),
+                    color = Color(0xFFE9D5FF),
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 3.dp, end = 5.dp)
+                )
+            }
+            Text(
+                text = key.label,
+                color = Color.White,
+                fontSize = if (key.label.length > 2) 12.sp else 19.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+@Composable
 private fun BlackoutCurtain(
     isLocked: Boolean,
     onWake: () -> Unit
@@ -844,7 +1199,10 @@ private fun BlackoutCurtain(
 }
 
 @Composable
-private fun GestureInstructionOverlay(onDismiss: () -> Unit) {
+private fun GestureInstructionOverlay(
+    advancedMode: Boolean,
+    onDismiss: () -> Unit
+) {
     val guides = listOf(
         R.drawable.gesture_left to "Left gesture",
         R.drawable.gesture_right to "Right gesture",
@@ -874,8 +1232,8 @@ private fun GestureInstructionOverlay(onDismiss: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "Gesture guide",
-                        color = Color.White,
+                        text = if (advancedMode) "Advanced gesture lab" else "Gesture guide",
+                        color = if (advancedMode) Color(0xFFE9D5FF) else Color.White,
                         fontSize = 18.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -890,7 +1248,21 @@ private fun GestureInstructionOverlay(onDismiss: () -> Unit) {
                     )
                 }
 
-                if (landscape) {
+                if (advancedMode) {
+                    listOf(
+                        "\u25CC  CLOSED-GRIP KNOB" to
+                            "Close all fingers around an imaginary dial, hold briefly, then twist clockwise for volume up or counter-clockwise for volume down.",
+                        "\u2194  THUMB RUB" to
+                            "Keep thumb and index in contact, then rub laterally for repeated left/right navigation.",
+                        "\u270C  UP / THREE DOWN" to
+                            "Hold a peace sign for repeated Up, or hold up index, middle, and ring fingers for repeated Down. Both work in either mode.",
+                        "\u2328  HOVER KEYBOARD" to
+                            "Point at the large transparent QWERTY keyboard near the top and hold through the three-stage ring to type."
+                    ).forEach { (title, detail) ->
+                        AdvancedGuideCard(title, detail)
+                        Spacer(Modifier.height(7.dp))
+                    }
+                } else if (landscape) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -913,6 +1285,32 @@ private fun GestureInstructionOverlay(onDismiss: () -> Unit) {
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun AdvancedGuideCard(
+    title: String,
+    detail: String
+) {
+    Surface(
+        color = Color(0xFF2E1065).copy(alpha = 0.74f),
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 13.dp, vertical = 10.dp)) {
+            Text(
+                text = title,
+                color = Color(0xFFE9D5FF),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = detail,
+                color = Color.White.copy(alpha = 0.82f),
+                fontSize = 12.sp
+            )
         }
     }
 }
@@ -965,6 +1363,7 @@ private fun CameraPermissionPanel(
 @Composable
 private fun HandLandmarkOverlay(
     state: GestureOverlayState,
+    accentColor: Color,
     modifier: Modifier = Modifier
 ) {
     Canvas(modifier) {
@@ -982,7 +1381,7 @@ private fun HandLandmarkOverlay(
             HAND_CONNECTIONS.forEach { (start, end) ->
                 if (start < hand.size && end < hand.size) {
                     drawLine(
-                        color = Color(0xFF55D6FF),
+                        color = accentColor,
                         start = map(hand[start]),
                         end = map(hand[end]),
                         strokeWidth = 3.dp.toPx(),
@@ -1086,10 +1485,13 @@ private class GestureFrameAnalyzer(
     private val onError: (String) -> Unit
 ) : ImageAnalysis.Analyzer, AutoCloseable {
     private val interpreter = GestureInterpreter()
+    private val landmarkStabilizer = LandmarkStabilizer()
     @Volatile
     var writingMode: Boolean = false
     @Volatile
     var pointerMode: Boolean = false
+    @Volatile
+    var advancedMode: Boolean = false
     private var lastTimestampMs = 0L
     private var recognizer: GestureRecognizer? = GestureRecognizer.createFromOptions(
         context,
@@ -1097,9 +1499,9 @@ private class GestureFrameAnalyzer(
             .setBaseOptions(BaseOptions.builder().setModelAssetPath(GESTURE_MODEL).build())
             .setRunningMode(RunningMode.VIDEO)
             .setNumHands(2)
-            .setMinHandDetectionConfidence(0.55f)
-            .setMinHandPresenceConfidence(0.55f)
-            .setMinTrackingConfidence(0.55f)
+            .setMinHandDetectionConfidence(0.60f)
+            .setMinHandPresenceConfidence(0.58f)
+            .setMinTrackingConfidence(0.62f)
             .build()
     )
 
@@ -1119,8 +1521,10 @@ private class GestureFrameAnalyzer(
                         bitmap.height,
                         inference,
                         interpreter,
+                        landmarkStabilizer,
                         writingMode,
-                        pointerMode
+                        pointerMode,
+                        advancedMode
                     )
                 )
             }
@@ -1138,6 +1542,7 @@ private class GestureFrameAnalyzer(
 
     fun resetTracking() {
         interpreter.reset()
+        landmarkStabilizer.reset()
     }
 }
 
@@ -1176,11 +1581,15 @@ private fun GestureRecognizerResult.toObservation(
     height: Int,
     inferenceMs: Long,
     interpreter: GestureInterpreter,
+    landmarkStabilizer: LandmarkStabilizer,
     writingMode: Boolean,
-    pointerMode: Boolean
+    pointerMode: Boolean,
+    advancedMode: Boolean
 ): GestureObservation {
     val allHands = landmarks().map { hand ->
-        hand.map { landmark -> LandmarkPoint(landmark.x(), landmark.y()) }
+        hand.map { landmark ->
+            LandmarkPoint(landmark.x(), landmark.y(), landmark.z())
+        }
     }
     val allCategories = gestures().map { candidates ->
         candidates.maxByOrNull { it.score() }
@@ -1194,14 +1603,16 @@ private fun GestureRecognizerResult.toObservation(
             hypot(hand[0].x - hand[9].x, hand[0].y - hand[9].y) >=
             MIN_USABLE_HAND_SCALE
     }
-    val hands = usableIndices.map { allHands[it] }
+    val rawHands = usableIndices.map { allHands[it] }
+    val hands = landmarkStabilizer.stabilize(rawHands, advancedMode)
     val categories = usableIndices.map { allCategories.getOrNull(it).orEmpty() }
     val interpretation = interpreter.interpret(
         categories = categories,
         hands = hands,
         now = SystemClock.uptimeMillis(),
         writingMode = writingMode,
-        pointerMode = pointerMode
+        pointerMode = pointerMode,
+        advancedMode = advancedMode
     )
     return GestureObservation(
         overlay = GestureOverlayState(hands, width, height),
@@ -1213,12 +1624,90 @@ private fun GestureRecognizerResult.toObservation(
         cursorChanged = interpretation.cursorChanged,
         pointerDelta = interpretation.pointerDelta,
         pointerPoint = interpretation.pointerPoint,
+        keyboardPoint = interpretation.keyboardPoint,
         writingPoint = interpretation.writingPoint,
         finishWritingStroke = interpretation.finishWritingStroke,
         commitWriting = interpretation.commitWriting,
         backspace = interpretation.backspace,
         inferenceMs = inferenceMs
     )
+}
+
+/**
+ * Adaptive landmark filtering keeps a still hand quiet enough for fine rub/knob
+ * motion while allowing large pointer movements through with very little lag.
+ * Hands are paired frame-to-frame by their wrist position, so two-hand order
+ * changes from MediaPipe do not make the overlay or gesture state jump.
+ */
+private class LandmarkStabilizer {
+    private var previousHands: List<List<LandmarkPoint>> = emptyList()
+
+    @Synchronized
+    fun stabilize(
+        currentHands: List<List<LandmarkPoint>>,
+        advanced: Boolean
+    ): List<List<LandmarkPoint>> {
+        if (currentHands.isEmpty()) {
+            previousHands = emptyList()
+            return emptyList()
+        }
+
+        val unusedPrevious = previousHands.indices.toMutableSet()
+        val result = currentHands.map { current ->
+            val match = unusedPrevious.minByOrNull { previousIndex ->
+                val previous = previousHands[previousIndex]
+                if (current.isEmpty() || previous.isEmpty()) {
+                    Float.MAX_VALUE
+                } else {
+                    hypot(
+                        current[0].x - previous[0].x,
+                        current[0].y - previous[0].y
+                    )
+                }
+            }?.takeIf { previousIndex ->
+                val previous = previousHands[previousIndex]
+                current.isNotEmpty() && previous.isNotEmpty() &&
+                    hypot(
+                        current[0].x - previous[0].x,
+                        current[0].y - previous[0].y
+                    ) < 0.28f
+            }
+            if (match == null) {
+                current
+            } else {
+                unusedPrevious.remove(match)
+                val previous = previousHands[match]
+                current.mapIndexed { index, point ->
+                    val old = previous.getOrNull(index) ?: return@mapIndexed point
+                    val motion = hypot(point.x - old.x, point.y - old.y)
+                    val alpha = if (advanced) {
+                        when {
+                            motion > 0.035f -> 0.84f
+                            motion > 0.012f -> 0.64f
+                            else -> 0.40f
+                        }
+                    } else {
+                        when {
+                            motion > 0.035f -> 0.88f
+                            else -> 0.68f
+                        }
+                    }
+                    LandmarkPoint(
+                        x = old.x + (point.x - old.x) * alpha,
+                        y = old.y + (point.y - old.y) * alpha,
+                        z = old.z + (point.z - old.z) * alpha
+                    )
+                }
+            }
+        }
+        previousHands = result
+        return result
+    }
+
+    @Synchronized
+    fun reset() {
+        previousHands = emptyList()
+    }
 }
 
 private class GestureInterpreter {
@@ -1249,6 +1738,13 @@ private class GestureInterpreter {
     private var backspaceLatched = false
     private var hasPendingInk = false
     private var suppressCursorToggleUntilRelease = false
+    private var knobLastAngle: Float? = null
+    private var knobGripStartedAt = 0L
+    private var knobAccumulatedAngle = 0f
+    private var knobLastSentAt = 0L
+    private var rubLastPosition: Float? = null
+    private var rubAccumulatedDistance = 0f
+    private var rubLastSentAt = 0L
 
     @Synchronized
     fun interpret(
@@ -1256,7 +1752,8 @@ private class GestureInterpreter {
         hands: List<List<LandmarkPoint>>,
         now: Long,
         writingMode: Boolean,
-        pointerMode: Boolean
+        pointerMode: Boolean,
+        advancedMode: Boolean
     ): GestureInterpretation {
         val bothHandsExtended = hands.size >= 2 &&
             hands.take(2).withIndex().all { (index, hand) ->
@@ -1295,6 +1792,13 @@ private class GestureInterpreter {
             hasPendingInk = false
             resetPointer()
         }
+        if (advancedMode && browserInteractionAvailable && !browserCursorActive) {
+            browserCursorActive = true
+            cursorChanged = true
+            wasWriting = false
+            hasPendingInk = false
+            resetPointer()
+        }
 
         val pinchHandIndices = hands.indices.filter { index ->
             hands[index].size >= 21 && isIndexPinch(hands[index])
@@ -1318,7 +1822,8 @@ private class GestureInterpreter {
                 hasPinchSupport(index)
         }
 
-        val rawCursorTogglePose = browserInteractionAvailable &&
+        val rawCursorTogglePose = !advancedMode &&
+            browserInteractionAvailable &&
             !controlsLocked &&
             openHandWithPinchIndex != null
         val finishingLetterPose = browserCursorActive &&
@@ -1417,8 +1922,50 @@ private class GestureInterpreter {
             )
         }
 
+        interpretSharedUpDownSigns(category, primary, now)?.let { direction ->
+            return GestureInterpretation(
+                detected = direction.first,
+                action = direction.second,
+                isLocked = false,
+                cursorActive = browserCursorActive
+            )
+        }
+
+        if (advancedMode && writingMode) {
+            resetPointer()
+            val keyboardHand = hands.firstOrNull { hand ->
+                hand.size >= 21 && isPointingIndex(hand)
+            }
+            return GestureInterpretation(
+                detected = if (keyboardHand != null) {
+                    "Advanced keyboard - hold your index over a key"
+                } else {
+                    "Advanced keyboard - point one index finger at the phone"
+                },
+                isLocked = false,
+                cursorActive = true,
+                keyboardPoint = keyboardHand?.let { hand ->
+                    AirInkPoint(hand[8].x, hand[8].y, now)
+                }
+            )
+        }
+
+        if (advancedMode) {
+            interpretAdvanced(category, primary, now)?.let { advanced ->
+                return GestureInterpretation(
+                    detected = advanced.first,
+                    action = advanced.second,
+                    isLocked = false,
+                    cursorActive = browserCursorActive
+                )
+            }
+        } else {
+            resetAdvancedGestures()
+        }
+
         val twoHandWritingActive = writingHandIndex != null
-        if (browserCursorActive &&
+        if (!advancedMode &&
+            browserCursorActive &&
             (writingMode || hasPendingInk || twoHandWritingActive)
         ) {
             resetPointer()
@@ -1526,9 +2073,11 @@ private class GestureInterpreter {
                     finishWritingStroke = true
                 )
             }
-            if (pointerMode && browserCursorActive && isIndexOnly(primary)) {
+            if (pointerMode && browserCursorActive &&
+                if (advancedMode) isPointingIndex(primary) else isIndexOnly(primary)
+            ) {
                 val tip = primary[8]
-                val pointer = pointerDelta(tip, now)
+                val pointer = pointerDelta(tip, now, advancedMode)
                 clearHeldPose()
                 return GestureInterpretation(
                     detected = "Browser pointer tracking",
@@ -1548,6 +2097,167 @@ private class GestureInterpreter {
             isLocked = false,
             cursorActive = browserCursorActive
         )
+    }
+
+    private fun interpretSharedUpDownSigns(
+        category: String,
+        landmarks: List<LandmarkPoint>,
+        now: Long
+    ): Pair<String, GestureAction?>? {
+        val fingers = fingerState(landmarks)
+        val isThree = fingers.index && fingers.middle && fingers.ring && !fingers.pinky
+        val isPeace = !isThree && (
+            category == "Victory" ||
+                (fingers.index && fingers.middle && !fingers.ring && !fingers.pinky)
+            )
+        if (!isPeace && !isThree) {
+            return null
+        }
+
+        resetAdvancedGestures()
+        return if (isPeace) {
+            repeatingPose(
+                pose = "PeaceUp",
+                now = now,
+                holdMs = 220L,
+                repeatMs = 310L,
+                waitingText = "Peace sign detected - hold for Up",
+                action = GestureAction("Up", listOf(RemoteCommand.KEY_UP))
+            )
+        } else {
+            repeatingPose(
+                pose = "ThreeDown",
+                now = now,
+                holdMs = 220L,
+                repeatMs = 310L,
+                waitingText = "Three-finger sign detected - hold for Down",
+                action = GestureAction("Down", listOf(RemoteCommand.KEY_DOWN))
+            )
+        }
+    }
+
+    private fun interpretAdvanced(
+        category: String,
+        landmarks: List<LandmarkPoint>,
+        now: Long
+    ): Pair<String, GestureAction?>? {
+        val fingers = fingerState(landmarks)
+        val palmSize = distance(landmarks[0], landmarks[9]).coerceAtLeast(0.01f)
+        val thumbOnIndex = distanceToSegment(
+            point = landmarks[4],
+            start = landmarks[6],
+            end = landmarks[8]
+        ) / palmSize
+        val rubPose = fingers.index && !fingers.middle && !fingers.ring &&
+            !fingers.pinky && thumbOnIndex < 0.38f
+        if (rubPose) {
+            clearHeldPose()
+            resetKnob()
+            val axisX = landmarks[8].x - landmarks[6].x
+            val axisY = landmarks[8].y - landmarks[6].y
+            val axisLength = hypot(axisX, axisY).coerceAtLeast(0.01f)
+            val thumbX = landmarks[4].x - landmarks[6].x
+            val thumbY = landmarks[4].y - landmarks[6].y
+            val rubPosition = (axisX * thumbY - axisY * thumbX) /
+                (axisLength * palmSize)
+            val previousRub = rubLastPosition
+            rubLastPosition = rubPosition
+            if (previousRub == null) {
+                return "Index rub ready - move thumb left or right" to null
+            }
+            val change = rubPosition - previousRub
+            if (abs(change) < 0.32f) {
+                rubAccumulatedDistance =
+                    rubAccumulatedDistance * 0.70f + change
+            }
+            if (abs(rubAccumulatedDistance) >= RUB_STEP_DISTANCE &&
+                now - rubLastSentAt >= ADVANCED_GESTURE_INTERVAL_MS
+            ) {
+                val movedRight = rubAccumulatedDistance > 0f
+                rubAccumulatedDistance = 0f
+                rubLastSentAt = now
+                val action = if (movedRight) {
+                    GestureAction("Index rub right", listOf(RemoteCommand.KEY_RIGHT))
+                } else {
+                    GestureAction("Index rub left", listOf(RemoteCommand.KEY_LEFT))
+                }
+                return "${action.label} - keep rubbing to repeat" to action
+            }
+            return "Index rub tracking - slide the thumb across the index" to null
+        }
+
+        // Keep the original thumb volume gestures available in Advanced mode.
+        // They must fall through to interpretSingle instead of being mistaken
+        // for a closed volume-knob grip.
+        val thumbOnlyPose = fingers.thumb && !fingers.index && !fingers.middle &&
+            !fingers.ring && !fingers.pinky
+        if (thumbOnlyPose || category == "Thumb_Up" || category == "Thumb_Down") {
+            resetAdvancedGestures()
+            return null
+        }
+
+        val closedGrip = category == "Closed_Fist" ||
+            (!fingers.thumb && !fingers.index && !fingers.middle &&
+                !fingers.ring && !fingers.pinky)
+        if (closedGrip) {
+            clearHeldPose()
+            resetRub()
+            val palmAngle = atan2(
+                landmarks[17].y - landmarks[5].y,
+                landmarks[17].x - landmarks[5].x
+            )
+            if (knobGripStartedAt == 0L) {
+                knobGripStartedAt = now
+                knobLastAngle = palmAngle
+                return "Volume knob grip detected - hold, then twist" to null
+            }
+            val previousAngle = knobLastAngle
+            knobLastAngle = palmAngle
+            if (previousAngle == null || now - knobGripStartedAt < KNOB_GRIP_SETTLE_MS) {
+                return "Volume knob calibrated - twist naturally" to null
+            }
+            val change = normalizeAngle(palmAngle - previousAngle)
+            if (abs(change) < 0.42f) {
+                knobAccumulatedAngle =
+                    knobAccumulatedAngle * 0.84f + change
+            }
+            if (abs(knobAccumulatedAngle) >= KNOB_STEP_RADIANS &&
+                now - knobLastSentAt >= ADVANCED_GESTURE_INTERVAL_MS
+            ) {
+                val clockwise = knobAccumulatedAngle > 0f
+                knobAccumulatedAngle = 0f
+                knobLastSentAt = now
+                val action = if (clockwise) {
+                    GestureAction("Knob clockwise - volume up", listOf(RemoteCommand.KEY_VOLUP))
+                } else {
+                    GestureAction(
+                        "Knob counter-clockwise - volume down",
+                        listOf(RemoteCommand.KEY_VOLDOWN)
+                    )
+                }
+                return "${action.label} - keep twisting to repeat" to action
+            }
+            return "Volume knob tracking - twist the closed grip" to null
+        }
+
+        resetAdvancedGestures()
+        return null
+    }
+
+    private fun resetAdvancedGestures() {
+        resetKnob()
+        resetRub()
+    }
+
+    private fun resetKnob() {
+        knobLastAngle = null
+        knobGripStartedAt = 0L
+        knobAccumulatedAngle = 0f
+    }
+
+    private fun resetRub() {
+        rubLastPosition = null
+        rubAccumulatedDistance = 0f
     }
 
     private fun interpretSingle(
@@ -1592,23 +2302,6 @@ private class GestureInterpreter {
         val palmWidth = distance(landmarks[5], landmarks[17]).coerceAtLeast(0.01f)
         val thumbSpreadRatio = distance(landmarks[4], landmarks[9]) / palmWidth
         val thumbOpenForHome = thumbSpreadRatio > 0.72f
-
-        if (category == "Victory" ||
-            (fingers.index && fingers.middle &&
-                !fingers.ring && !fingers.pinky)
-        ) {
-            return heldPose(
-                pose = "YouTube",
-                now = now,
-                holdMs = 260L,
-                waitingText = "Peace sign detected - hold briefly for YouTube",
-                action = GestureAction(
-                    label = "Open YouTube",
-                    commands = emptyList(),
-                    launchYouTube = true
-                )
-            )
-        }
 
         if (thumbOpenForHome && fingers.index && fingers.pinky &&
             !fingers.middle && !fingers.ring
@@ -1816,6 +2509,7 @@ private class GestureInterpreter {
         pose: String,
         now: Long,
         holdMs: Long,
+        repeatMs: Long = 420L,
         waitingText: String,
         action: GestureAction
     ): Pair<String, GestureAction?> {
@@ -1828,7 +2522,7 @@ private class GestureInterpreter {
         }
         if (now >= nextRepeatAt) {
             poseLatched = true
-            nextRepeatAt = now + 420L
+            nextRepeatAt = now + repeatMs
             return "${action.label} — keep holding to repeat" to action
         }
         return if (poseLatched) {
@@ -1838,7 +2532,11 @@ private class GestureInterpreter {
         } to null
     }
 
-    private fun pointerDelta(point: LandmarkPoint, now: Long): PointerDelta? {
+    private fun pointerDelta(
+        point: LandmarkPoint,
+        now: Long,
+        advanced: Boolean
+    ): PointerDelta? {
         val previous = lastPointerPoint
         val previousAt = lastPointerAt
         lastPointerPoint = point
@@ -1849,14 +2547,23 @@ private class GestureInterpreter {
             return null
         }
 
-        val rawX = (point.x - previous.x) * POINTER_X_GAIN
-        val rawY = (point.y - previous.y) * POINTER_Y_GAIN
-        smoothedPointerX = smoothedPointerX * 0.32f + rawX * 0.68f
-        smoothedPointerY = smoothedPointerY * 0.32f + rawY * 0.68f
-        if (now - lastPointerSentAt < POINTER_SEND_INTERVAL_MS) return null
+        val xGain = if (advanced) ADVANCED_POINTER_X_GAIN else POINTER_X_GAIN
+        val yGain = if (advanced) ADVANCED_POINTER_Y_GAIN else POINTER_Y_GAIN
+        val smoothing = if (advanced) 0.82f else 0.68f
+        val rawX = (point.x - previous.x) * xGain
+        val rawY = (point.y - previous.y) * yGain
+        smoothedPointerX = smoothedPointerX * (1f - smoothing) + rawX * smoothing
+        smoothedPointerY = smoothedPointerY * (1f - smoothing) + rawY * smoothing
+        val sendInterval = if (advanced) {
+            ADVANCED_POINTER_SEND_INTERVAL_MS
+        } else {
+            POINTER_SEND_INTERVAL_MS
+        }
+        if (now - lastPointerSentAt < sendInterval) return null
 
-        var deltaX = smoothedPointerX.roundToInt().coerceIn(-POINTER_MAX_STEP, POINTER_MAX_STEP)
-        var deltaY = smoothedPointerY.roundToInt().coerceIn(-POINTER_MAX_STEP, POINTER_MAX_STEP)
+        val maxStep = if (advanced) ADVANCED_POINTER_MAX_STEP else POINTER_MAX_STEP
+        var deltaX = smoothedPointerX.roundToInt().coerceIn(-maxStep, maxStep)
+        var deltaY = smoothedPointerY.roundToInt().coerceIn(-maxStep, maxStep)
         if (abs(deltaX) < POINTER_DEAD_ZONE) deltaX = 0
         if (abs(deltaY) < POINTER_DEAD_ZONE) deltaY = 0
         if (deltaX == 0 && deltaY == 0) return null
@@ -1887,6 +2594,12 @@ private class GestureInterpreter {
         cooldownUntil = 0L
         resetPointer()
         wasWriting = false
+        browserCursorActive = false
+        cursorToggleStartedAt = 0L
+        cursorToggleLatched = false
+        cursorToggleReleasedAt = 0L
+        hasPendingInk = false
+        resetAdvancedGestures()
     }
 
     private fun palmCenter(points: List<LandmarkPoint>): LandmarkPoint {
@@ -1900,10 +2613,40 @@ private class GestureInterpreter {
     private fun distance(a: LandmarkPoint, b: LandmarkPoint): Float =
         hypot(a.x - b.x, a.y - b.y)
 
+    private fun distanceToSegment(
+        point: LandmarkPoint,
+        start: LandmarkPoint,
+        end: LandmarkPoint
+    ): Float {
+        val dx = end.x - start.x
+        val dy = end.y - start.y
+        val lengthSquared = dx * dx + dy * dy
+        if (lengthSquared <= 0.000001f) return distance(point, start)
+        val projection = (
+            ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
+        ).coerceIn(0f, 1f)
+        return hypot(
+            point.x - (start.x + projection * dx),
+            point.y - (start.y + projection * dy)
+        )
+    }
+
+    private fun normalizeAngle(angle: Float): Float {
+        var normalized = angle
+        while (normalized > Math.PI) normalized -= (Math.PI * 2.0).toFloat()
+        while (normalized < -Math.PI) normalized += (Math.PI * 2.0).toFloat()
+        return normalized
+    }
+
     private fun isIndexOnly(points: List<LandmarkPoint>): Boolean {
         val fingers = fingerState(points)
         return fingers.index && !fingers.thumb && !fingers.middle &&
             !fingers.ring && !fingers.pinky
+    }
+
+    private fun isPointingIndex(points: List<LandmarkPoint>): Boolean {
+        val fingers = fingerState(points)
+        return fingers.index && !fingers.middle && !fingers.ring && !fingers.pinky
     }
 
     private fun isMiddleOnly(points: List<LandmarkPoint>): Boolean {
@@ -1967,6 +2710,14 @@ private class GestureInterpreter {
         const val POINTER_Y_GAIN = 2200f
         const val POINTER_MAX_STEP = 180
         const val POINTER_DEAD_ZONE = 3
+        const val ADVANCED_POINTER_SEND_INTERVAL_MS = 30L
+        const val ADVANCED_POINTER_X_GAIN = 5200f
+        const val ADVANCED_POINTER_Y_GAIN = 4600f
+        const val ADVANCED_POINTER_MAX_STEP = 320
+        const val ADVANCED_GESTURE_INTERVAL_MS = 125L
+        const val KNOB_GRIP_SETTLE_MS = 180L
+        const val KNOB_STEP_RADIANS = 0.115f
+        const val RUB_STEP_DISTANCE = 0.060f
     }
 }
 

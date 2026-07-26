@@ -89,10 +89,15 @@ The built-in gesture camera turns your hand into a touch-free Samsung TV remote.
 * Hold your thumb upright for **Volume Up** or sideways in either direction for **Volume Down**.
 * Pinch your thumb and index finger for **OK / click**.
 * Pinch your thumb and pinky for a **double click**, with one second between clicks.
-* Hold a **peace sign** to open YouTube on the TV.
+* Hold a **peace sign** for repeated **Up**.
+* Hold up your index, middle, and ring fingers for repeated **Down**.
 * Use the illustrated horns sign with the thumb folded for **Back**.
 * Use the illustrated three-finger sign with the thumb extended for **Home**.
 * Use an open-palm swipe for directional navigation.
+
+Advanced mode adds an automatic, higher-speed Samsung Browser pointer, a natural closed-grip
+volume knob, thumb-on-index rubbing for repeated left/right navigation, and a large transparent
+QWERTY keyboard near the top of the camera that selects keys by holding the index finger over them.
 
 ## Project Goals
 
