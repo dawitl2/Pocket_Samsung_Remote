@@ -606,7 +606,7 @@ fun GestureCameraScreen(
                 )
             }
 
-            if (pointerEnabled && !isLocked) {
+            if ((pointerEnabled || imeActive) && !isLocked) {
                 Surface(
                     color = if (cursorActive) {
                         Color(0xFF0369A1).copy(alpha = 0.92f)
@@ -632,7 +632,7 @@ fun GestureCameraScreen(
                 }
             }
 
-            if (imeActive && cursorActive && !isLocked) {
+            if (cursorActive && !isLocked) {
                 Surface(
                     color = Color.Black.copy(alpha = 0.66f),
                     shape = RoundedCornerShape(14.dp),
@@ -1152,6 +1152,8 @@ private class GestureInterpreter {
     private var commitLatched = false
     private var backspaceStartedAt = 0L
     private var backspaceLatched = false
+    private var hasPendingInk = false
+    private var suppressCursorToggleUntilRelease = false
 
     @Synchronized
     fun interpret(
@@ -1189,25 +1191,50 @@ private class GestureInterpreter {
             }
         }
 
+        val browserInteractionAvailable = pointerMode || writingMode
         var cursorChanged = false
-        if (!pointerMode && browserCursorActive) {
+        if (!browserInteractionAvailable && browserCursorActive) {
             browserCursorActive = false
             cursorChanged = true
             wasWriting = false
+            hasPendingInk = false
             resetPointer()
         }
 
-        val cursorTogglePose = pointerMode && !controlsLocked && hands.size >= 2 &&
-            hands.indices.any { openIndex ->
-                val openHand = hands[openIndex]
-                openHand.size >= 21 &&
-                    isOpenHand(openHand, categories.getOrNull(openIndex).orEmpty()) &&
-                    hands.indices.any { pinchIndex ->
-                        pinchIndex != openIndex &&
-                            hands[pinchIndex].size >= 21 &&
-                            isIndexPinch(hands[pinchIndex])
-                    }
-            }
+        val pinchHandIndices = hands.indices.filter { index ->
+            hands[index].size >= 21 && isIndexPinch(hands[index])
+        }
+        fun hasPinchSupport(handIndex: Int): Boolean =
+            pinchHandIndices.any { it != handIndex }
+
+        val writingHandIndex = hands.indices.firstOrNull { index ->
+            hands[index].size >= 21 &&
+                isIndexOnly(hands[index]) &&
+                hasPinchSupport(index)
+        }
+        val openHandWithPinchIndex = hands.indices.firstOrNull { index ->
+            hands[index].size >= 21 &&
+                isOpenHand(hands[index], categories.getOrNull(index).orEmpty()) &&
+                hasPinchSupport(index)
+        }
+        val middleHandWithPinchIndex = hands.indices.firstOrNull { index ->
+            hands[index].size >= 21 &&
+                isMiddleOnly(hands[index]) &&
+                hasPinchSupport(index)
+        }
+
+        val rawCursorTogglePose = browserInteractionAvailable &&
+            !controlsLocked &&
+            openHandWithPinchIndex != null
+        val finishingLetterPose = browserCursorActive &&
+            hasPendingInk &&
+            openHandWithPinchIndex != null
+        if (!rawCursorTogglePose) {
+            suppressCursorToggleUntilRelease = false
+        }
+        val cursorTogglePose = rawCursorTogglePose &&
+            !finishingLetterPose &&
+            !suppressCursorToggleUntilRelease
         if (cursorTogglePose) {
             cursorToggleReleasedAt = 0L
             if (cursorToggleStartedAt == 0L) cursorToggleStartedAt = now
@@ -1218,6 +1245,7 @@ private class GestureInterpreter {
                 cursorToggleLatched = true
                 cursorChanged = true
                 wasWriting = false
+                hasPendingInk = false
                 clearHeldPose()
                 resetPointer()
             }
@@ -1294,18 +1322,23 @@ private class GestureInterpreter {
             )
         }
 
-        if (writingMode && browserCursorActive) {
+        val twoHandWritingActive = writingHandIndex != null
+        if (browserCursorActive &&
+            (writingMode || hasPendingInk || twoHandWritingActive)
+        ) {
             resetPointer()
-            val openCommit = !bothHandsExtended && hands.indices.any { index ->
-                isOpenHand(hands[index], categories.getOrNull(index).orEmpty())
-            }
+            val openCommit = hasPendingInk && openHandWithPinchIndex != null
             if (openCommit) {
                 backspaceStartedAt = 0L
                 backspaceLatched = false
                 if (commitStartedAt == 0L) commitStartedAt = now
                 val shouldCommit = !commitLatched &&
                     now - commitStartedAt >= LETTER_COMMIT_HOLD_MS
-                if (shouldCommit) commitLatched = true
+                if (shouldCommit) {
+                    commitLatched = true
+                    hasPendingInk = false
+                    suppressCursorToggleUntilRelease = true
+                }
                 val finishedStroke = wasWriting
                 wasWriting = false
                 clearHeldPose()
@@ -1325,12 +1358,15 @@ private class GestureInterpreter {
                 commitLatched = false
             }
 
-            val middleBackspace = hands.any { it.size >= 21 && isMiddleOnly(it) }
+            val middleBackspace = middleHandWithPinchIndex != null
             if (middleBackspace) {
                 if (backspaceStartedAt == 0L) backspaceStartedAt = now
                 val shouldBackspace = !backspaceLatched &&
                     now - backspaceStartedAt >= BACKSPACE_HOLD_MS
-                if (shouldBackspace) backspaceLatched = true
+                if (shouldBackspace) {
+                    backspaceLatched = true
+                    hasPendingInk = false
+                }
                 wasWriting = false
                 clearHeldPose()
                 return GestureInterpretation(
@@ -1348,9 +1384,10 @@ private class GestureInterpreter {
                 backspaceLatched = false
             }
 
-            val writer = hands.firstOrNull { it.size >= 21 && isIndexOnly(it) }
+            val writer = writingHandIndex?.let(hands::get)
             if (writer != null) {
                 wasWriting = true
+                hasPendingInk = true
                 clearHeldPose()
                 return GestureInterpretation(
                     detected = "Drawing letter — live guesses are shown above",
